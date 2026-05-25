@@ -492,7 +492,7 @@ class MainWindow(QMainWindow):
         )
 
         self.persistence_spin = self.create_double_spinbox(
-            "Persistence—持续度（每层振幅衰减比例，越低细节越弱）",
+            "Persistence（每层振幅衰减比例，越低细节越弱）",
             0.1,
             1.0,
             0.5,
@@ -500,7 +500,7 @@ class MainWindow(QMainWindow):
         )
 
         self.lacunarity_spin = self.create_double_spinbox(
-            "Lacunarity—间隙度（每层频率增长比例，越高纹理越密）",
+            "Lacunarity（每层频率增长比例，越高纹理越密）",
             1.0,
             5.0,
             2.0,
