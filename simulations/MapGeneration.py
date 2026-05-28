@@ -374,6 +374,227 @@ class GeologyGenerator:
 
 
 # =========================================================
+# Fracture / Lens Config
+# =========================================================
+
+class FractureConfig:
+    """Configuration for a single fracture feature."""
+
+    def __init__(self, name="裂隙", length=15.0, width_cells=1,
+                 permeability=1000.0, color=None):
+        self.name = str(name)
+        self.length = float(length)
+        self.width_cells = max(1, width_cells)
+        self.permeability = float(permeability)
+        self.color = list(color) if color else [0.95, 0.15, 0.15]
+
+    def to_dict(self):
+        return {"name": self.name, "length": self.length,
+                "width_cells": self.width_cells,
+                "permeability": self.permeability, "color": self.color.copy()}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(name=d.get("name", "裂隙"), length=d.get("length", 15.0),
+                   width_cells=d.get("width_cells", 1),
+                   permeability=d.get("permeability", 1000.0),
+                   color=d.get("color", [0.95, 0.15, 0.15]))
+
+
+class LensConfig:
+    """Configuration for a single lens feature."""
+
+    def __init__(self, name="透镜体", radius=5.0,
+                 permeability=100.0, color=None):
+        self.name = str(name)
+        self.radius = float(radius)
+        self.permeability = float(permeability)
+        self.color = list(color) if color else [0.2, 0.8, 0.9]
+
+    def to_dict(self):
+        return {"name": self.name, "radius": self.radius,
+                "permeability": self.permeability, "color": self.color.copy()}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(name=d.get("name", "透镜体"), radius=d.get("radius", 5.0),
+                   permeability=d.get("permeability", 100.0),
+                   color=d.get("color", [0.2, 0.8, 0.9]))
+
+
+# =========================================================
+# Fracture Generator — Post-processing (config-list driven)
+# =========================================================
+
+class FractureGenerator:
+    """
+    Generate fractures from a FractureConfig list.
+    Each config produces one fracture line segment.
+    Fractures do NOT penetrate soil cap or ground surface.
+    """
+
+    def __init__(self, configs, seed=None):
+        # Accept FractureConfig objects or dicts
+        self.configs = []
+        for c in (configs or []):
+            if isinstance(c, dict):
+                self.configs.append(FractureConfig.from_dict(c))
+            else:
+                self.configs.append(c)
+        self.seed = seed
+
+    def generate(self, solid, x, y, z, stratum_tops, terrain_surface, inside_mask):
+        nx, ny, nz = solid.shape
+        if not self.configs or not stratum_tops:
+            return np.zeros((nx, ny, nz), dtype=np.int32)
+
+        rng = np.random.RandomState(self.seed)
+        fracture_ids = np.zeros((nx, ny, nz), dtype=np.int32)
+        n_strata = len(stratum_tops)
+
+        dx = float(x[1] - x[0]) if len(x) > 1 else 1.0
+        dy = float(y[1] - y[0]) if len(y) > 1 else 1.0
+        dz = float(z[1] - z[0]) if len(z) > 1 else 1.0
+        avg_d = (dx + dy + dz) / 3.0
+
+        rock_mask = (solid > 0) & (solid <= n_strata)
+        rock_indices = np.argwhere(rock_mask)
+        if len(rock_indices) == 0:
+            return fracture_ids
+
+        for fid, cfg in enumerate(self.configs, 1):
+            idx = rng.randint(0, len(rock_indices))
+            si, sj, sk = rock_indices[idx]
+
+            theta = rng.uniform(0, 2 * np.pi)
+            phi = np.arccos(rng.uniform(-1, 1))
+            dir_x = np.sin(phi) * np.cos(theta)
+            dir_y = np.sin(phi) * np.sin(theta)
+            dir_z = np.cos(phi)
+
+            current_len = 0.0
+            ci, cj, ck = float(si), float(sj), float(sk)
+            path_cells = []
+
+            while current_len < cfg.length:
+                ii, jj, kk = int(round(ci)), int(round(cj)), int(round(ck))
+                if not (0 <= ii < nx and 0 <= jj < ny and 0 <= kk < nz):
+                    break
+                if not inside_mask[ii, jj]:
+                    break
+                cell_marker = solid[ii, jj, kk]
+                if cell_marker == 0 or cell_marker == n_strata + 1:
+                    break
+                if z[kk] > terrain_surface[ii, jj]:
+                    break
+                path_cells.append((ii, jj, kk))
+                current_len += avg_d
+                ci += dir_x * avg_d / dx
+                cj += dir_y * avg_d / dy
+                ck += dir_z * avg_d / dz
+
+            # Mark path + width
+            wc = cfg.width_cells
+            for ii, jj, kk in path_cells:
+                fracture_ids[ii, jj, kk] = fid
+                if wc > 1:
+                    half = wc // 2
+                    for wi in range(-half, wc - half):
+                        for wj in range(-half, wc - half):
+                            ni_idx, nj_idx = ii + wi, jj + wj
+                            if (0 <= ni_idx < nx and 0 <= nj_idx < ny and
+                                    solid[ni_idx, nj_idx, kk] > 0 and
+                                    solid[ni_idx, nj_idx, kk] <= n_strata):
+                                fracture_ids[ni_idx, nj_idx, kk] = fid
+
+        return fracture_ids
+
+
+# =========================================================
+# Lens Generator — Post-processing (config-list driven)
+# =========================================================
+
+class LensGenerator:
+    """
+    Generate lenses from a LensConfig list.
+    Each config produces one ellipsoidal lens.
+    Lenses do NOT penetrate soil cap or ground surface.
+    """
+
+    def __init__(self, configs, seed=None):
+        # Accept LensConfig objects or dicts
+        self.configs = []
+        for c in (configs or []):
+            if isinstance(c, dict):
+                self.configs.append(LensConfig.from_dict(c))
+            else:
+                self.configs.append(c)
+        self.seed = seed
+
+    def generate(self, solid, x, y, z, stratum_tops, terrain_surface, inside_mask):
+        nx, ny, nz = solid.shape
+        if not self.configs or not stratum_tops:
+            return np.zeros((nx, ny, nz), dtype=np.int32)
+
+        rng = np.random.RandomState(self.seed)
+        lens_ids = np.zeros((nx, ny, nz), dtype=np.int32)
+        n_strata = len(stratum_tops)
+
+        dx = float(x[1] - x[0]) if len(x) > 1 else 1.0
+        dy = float(y[1] - y[0]) if len(y) > 1 else 1.0
+        dz = float(z[1] - z[0]) if len(z) > 1 else 1.0
+
+        # Pre-filter: rock cells that are inside the boundary
+        rock_mask = (solid > 0) & (solid <= n_strata) & inside_mask[:, :, np.newaxis]
+        rock_indices = np.argwhere(rock_mask)
+        if len(rock_indices) == 0:
+            return lens_ids
+
+        # Top surface of rock = stratum_tops[-1] (contact with soil cap)
+        rock_top = stratum_tops[-1] if stratum_tops else terrain_surface
+
+        for lid, cfg in enumerate(self.configs, 1):
+            max_retries = 50
+            placed = False
+
+            for _attempt in range(max_retries):
+                # Pick center from rock cells inside boundary
+                idx = rng.randint(0, len(rock_indices))
+                ci, cj, ck = rock_indices[idx]
+
+                # Random ellipsoid axes (natural variation)
+                rx = max(1, int(cfg.radius / dx * rng.uniform(0.7, 1.3)))
+                ry = max(1, int(cfg.radius / dy * rng.uniform(0.7, 1.3)))
+                rz = max(1, int(cfg.radius / dz * rng.uniform(0.7, 1.3)))
+
+                # Check: ellipsoid top must not exceed rock top surface
+                # (so it won't penetrate soil cap)
+                top_z = z[ck] + rz * dz
+                if top_z > rock_top[ci, cj]:
+                    continue  # too close to surface, try again
+
+                # Generate ellipsoid — cells outside boundary are naturally
+                # clipped by the inside_mask check, so boundary truncation is OK
+                for ii in range(max(0, ci - rx), min(nx, ci + rx + 1)):
+                    for jj in range(max(0, cj - ry), min(ny, cj + ry + 1)):
+                        for kk in range(max(0, ck - rz), min(nz, ck + rz + 1)):
+                            if not inside_mask[ii, jj]:
+                                continue
+                            dx_n = (ii - ci) / max(rx, 1)
+                            dy_n = (jj - cj) / max(ry, 1)
+                            dz_n = (kk - ck) / max(rz, 1)
+                            if dx_n**2 + dy_n**2 + dz_n**2 > 1.0:
+                                continue
+                            if solid[ii, jj, kk] > 0 and solid[ii, jj, kk] <= n_strata:
+                                lens_ids[ii, jj, kk] = lid
+
+                placed = True
+                break  # successfully placed
+
+        return lens_ids
+
+
+# =========================================================
 # Stratum Edit Dialog
 # =========================================================
 
@@ -477,6 +698,166 @@ class StratumEditDialog(QDialog):
 
 
 # =========================================================
+# Fracture Edit Dialog
+# =========================================================
+
+class FractureEditDialog(QDialog):
+    def __init__(self, config=None, parent=None):
+        super().__init__(parent)
+        self.config = config or FractureConfig()
+        self.setWindowTitle("编辑裂隙")
+        self.setMinimumWidth(350)
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        form = QFormLayout()
+
+        self.name_edit = QLineEdit(self.config.name)
+        form.addRow("裂隙名称:", self.name_edit)
+
+        self.length_spin = QDoubleSpinBox()
+        self.length_spin.setRange(1.0, 200.0)
+        self.length_spin.setValue(self.config.length)
+        self.length_spin.setSingleStep(1.0)
+        self.length_spin.setDecimals(1)
+        form.addRow("长度 (m):", self.length_spin)
+
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(1, 10)
+        self.width_spin.setValue(self.config.width_cells)
+        form.addRow("宽度 (cell数):", self.width_spin)
+
+        self.perm_spin = QDoubleSpinBox()
+        self.perm_spin.setRange(0.0, 100000.0)
+        self.perm_spin.setDecimals(4)
+        self.perm_spin.setSingleStep(1.0)
+        self.perm_spin.setValue(round(self.config.permeability, 4))
+        form.addRow("渗透系数 K:", self.perm_spin)
+
+        color_layout = QHBoxLayout()
+        self.color_preview = QPushButton()
+        self.color_preview.setFixedSize(50, 28)
+        self.current_color = QColor(
+            int(self.config.color[0]*255), int(self.config.color[1]*255), int(self.config.color[2]*255))
+        self._update_color_preview()
+        self.color_preview.clicked.connect(self.choose_color)
+        color_layout.addWidget(self.color_preview)
+        color_layout.addWidget(QLabel("点击选择颜色"))
+        color_layout.addStretch()
+        form.addRow("裂隙颜色:", color_layout)
+
+        layout.addLayout(form)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        ok_btn = QPushButton("确定")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def choose_color(self):
+        color = QColorDialog.getColor(self.current_color, self, "选择裂隙颜色")
+        if color.isValid():
+            self.current_color = color
+            self._update_color_preview()
+
+    def _update_color_preview(self):
+        self.color_preview.setStyleSheet(
+            f"background-color: {self.current_color.name()}; border: 1px solid #999; border-radius: 3px;")
+
+    def get_config(self):
+        return FractureConfig(
+            name=self.name_edit.text().strip() or "裂隙",
+            length=self.length_spin.value(),
+            width_cells=self.width_spin.value(),
+            permeability=round(self.perm_spin.value(), 4),
+            color=[self.current_color.redF(), self.current_color.greenF(), self.current_color.blueF()],
+        )
+
+
+# =========================================================
+# Lens Edit Dialog
+# =========================================================
+
+class LensEditDialog(QDialog):
+    def __init__(self, config=None, parent=None):
+        super().__init__(parent)
+        self.config = config or LensConfig()
+        self.setWindowTitle("编辑透镜体")
+        self.setMinimumWidth(350)
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        form = QFormLayout()
+
+        self.name_edit = QLineEdit(self.config.name)
+        form.addRow("透镜体名称:", self.name_edit)
+
+        self.radius_spin = QDoubleSpinBox()
+        self.radius_spin.setRange(0.5, 100.0)
+        self.radius_spin.setValue(self.config.radius)
+        self.radius_spin.setSingleStep(0.5)
+        self.radius_spin.setDecimals(1)
+        form.addRow("半径 (m):", self.radius_spin)
+
+        self.perm_spin = QDoubleSpinBox()
+        self.perm_spin.setRange(0.0, 100000.0)
+        self.perm_spin.setDecimals(4)
+        self.perm_spin.setSingleStep(0.1)
+        self.perm_spin.setValue(round(self.config.permeability, 4))
+        form.addRow("渗透系数 K:", self.perm_spin)
+
+        color_layout = QHBoxLayout()
+        self.color_preview = QPushButton()
+        self.color_preview.setFixedSize(50, 28)
+        self.current_color = QColor(
+            int(self.config.color[0]*255), int(self.config.color[1]*255), int(self.config.color[2]*255))
+        self._update_color_preview()
+        self.color_preview.clicked.connect(self.choose_color)
+        color_layout.addWidget(self.color_preview)
+        color_layout.addWidget(QLabel("点击选择颜色"))
+        color_layout.addStretch()
+        form.addRow("透镜体颜色:", color_layout)
+
+        layout.addLayout(form)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        ok_btn = QPushButton("确定")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def choose_color(self):
+        color = QColorDialog.getColor(self.current_color, self, "选择透镜体颜色")
+        if color.isValid():
+            self.current_color = color
+            self._update_color_preview()
+
+    def _update_color_preview(self):
+        self.color_preview.setStyleSheet(
+            f"background-color: {self.current_color.name()}; border: 1px solid #999; border-radius: 3px;")
+
+    def get_config(self):
+        return LensConfig(
+            name=self.name_edit.text().strip() or "透镜体",
+            radius=self.radius_spin.value(),
+            permeability=round(self.perm_spin.value(), 4),
+            color=[self.current_color.redF(), self.current_color.greenF(), self.current_color.blueF()],
+        )
+
+
+# =========================================================
 # Main Window
 # =========================================================
 
@@ -506,8 +887,22 @@ class MainWindow(QMainWindow):
             StratumConfig("黏土层", thickness=10.0, color=[0.55, 0.40, 0.25], permeability=0.001, preset_name="黏土层"),
         ]
 
+        # Fracture configs (each produces one fracture)
+        self.fracture_configs = [
+            FractureConfig("主裂隙", length=15.0, width_cells=1, permeability=1000.0, color=[0.95, 0.15, 0.15]),
+            FractureConfig("次裂隙", length=10.0, width_cells=1, permeability=500.0, color=[0.85, 0.25, 0.25]),
+        ]
+
+        # Lens configs (each produces one lens)
+        self.lens_configs = [
+            LensConfig("砂透镜", radius=5.0, permeability=50.0, color=[0.2, 0.8, 0.9]),
+            LensConfig("砾透镜", radius=3.0, permeability=200.0, color=[0.3, 0.7, 0.85]),
+        ]
+
         self.setup_ui()
         self.refresh_stratum_list()
+        self.refresh_fracture_list()
+        self.refresh_lens_list()
 
     # ---- UI Setup ----
 
@@ -531,13 +926,17 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_basic, "基础参数")
         self._setup_basic_tab()
 
+        self.tab_noise = QWidget()
+        self.tabs.addTab(self.tab_noise, "噪声参数")
+        self._setup_noise_tab()
+
         self.tab_strata = QWidget()
         self.tabs.addTab(self.tab_strata, "地层管理")
         self._setup_strata_tab()
 
-        self.tab_noise = QWidget()
-        self.tabs.addTab(self.tab_noise, "噪声参数")
-        self._setup_noise_tab()
+        self.tab_hetero = QWidget()
+        self.tabs.addTab(self.tab_hetero, "非均质构造管理")
+        self._setup_hetero_tab()
 
         self.status_label = QLabel(" 就绪，可生成地质模型 ")
         self.status_label.setAlignment(Qt.AlignCenter)
@@ -549,11 +948,13 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.generate_button)
 
         export_layout = QHBoxLayout()
-        self.export_stl_btn = QPushButton("导出 STL")
-        self.export_stl_btn.clicked.connect(self.export_mesh_stl)
+        self.export_data_btn = QPushButton("导出网格数据")
+        self.export_data_btn.clicked.connect(self.export_mesh_data)
+        self.export_data_btn.setToolTip("导出 MODFLOW 友好的 .npz 格式")
         self.export_vtk_btn = QPushButton("导出 VTK")
         self.export_vtk_btn.clicked.connect(self.export_mesh_vtk)
-        export_layout.addWidget(self.export_stl_btn)
+        self.export_vtk_btn.setToolTip("导出 VTK 体素网格用于可视化")
+        export_layout.addWidget(self.export_data_btn)
         export_layout.addWidget(self.export_vtk_btn)
         control_layout.addLayout(export_layout)
         control_layout.addStretch()
@@ -635,6 +1036,68 @@ class MainWindow(QMainWindow):
         self.octave_spin = self._add_spin(layout, "噪声叠加层数", 1, 10, 5)
         self.persistence_spin = self._add_double(layout, "Persistence", 0.1, 1.0, 0.5, 0.05)
         self.lacunarity_spin = self._add_double(layout, "Lacunarity", 1.0, 5.0, 2.0, 0.1)
+        layout.addStretch()
+
+    def _setup_hetero_tab(self):
+        layout = QVBoxLayout()
+        self.tab_hetero.setLayout(layout)
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        # ---- Fracture list ----
+        frac_title = QLabel("— 裂隙列表 —")
+        frac_title.setStyleSheet("font-weight: bold; color: #c0392b;")
+        frac_title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(frac_title)
+
+        self.fracture_list = QListWidget()
+        self.fracture_list.setMinimumHeight(140)
+        self.fracture_list.itemDoubleClicked.connect(self.edit_selected_fracture)
+        layout.addWidget(self.fracture_list)
+
+        frac_btn = QGridLayout()
+        self.frac_add_btn = QPushButton("+ 添加")
+        self.frac_add_btn.clicked.connect(self.add_fracture)
+        self.frac_del_btn = QPushButton("- 删除")
+        self.frac_del_btn.clicked.connect(self.delete_selected_fracture)
+        self.frac_edit_btn = QPushButton("编辑")
+        self.frac_edit_btn.clicked.connect(self.edit_selected_fracture)
+        frac_btn.addWidget(self.frac_add_btn, 0, 0)
+        frac_btn.addWidget(self.frac_del_btn, 0, 1)
+        frac_btn.addWidget(self.frac_edit_btn, 0, 2)
+        layout.addLayout(frac_btn)
+
+        self.fracture_info = QLabel("2 个裂隙")
+        self.fracture_info.setStyleSheet("color: #666; font-size: 12px;")
+        layout.addWidget(self.fracture_info)
+
+        # ---- Lens list ----
+        lens_title = QLabel("— 透镜体列表 —")
+        lens_title.setStyleSheet("font-weight: bold; color: #2980b9; margin-top: 8px;")
+        lens_title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(lens_title)
+
+        self.lens_list = QListWidget()
+        self.lens_list.setMinimumHeight(140)
+        self.lens_list.itemDoubleClicked.connect(self.edit_selected_lens)
+        layout.addWidget(self.lens_list)
+
+        lens_btn = QGridLayout()
+        self.lens_add_btn = QPushButton("+ 添加")
+        self.lens_add_btn.clicked.connect(self.add_lens)
+        self.lens_del_btn = QPushButton("- 删除")
+        self.lens_del_btn.clicked.connect(self.delete_selected_lens)
+        self.lens_edit_btn = QPushButton("编辑")
+        self.lens_edit_btn.clicked.connect(self.edit_selected_lens)
+        lens_btn.addWidget(self.lens_add_btn, 0, 0)
+        lens_btn.addWidget(self.lens_del_btn, 0, 1)
+        lens_btn.addWidget(self.lens_edit_btn, 0, 2)
+        layout.addLayout(lens_btn)
+
+        self.lens_info = QLabel("2 个透镜体")
+        self.lens_info.setStyleSheet("color: #666; font-size: 12px;")
+        layout.addWidget(self.lens_info)
+
         layout.addStretch()
 
     def _add_spin(self, parent_layout, label, min_v, max_v, default):
@@ -817,6 +1280,92 @@ class MainWindow(QMainWindow):
         ]
         self.refresh_stratum_list()
 
+    # ---- Fracture CRUD ----
+
+    def refresh_fracture_list(self):
+        self.fracture_list.clear()
+        for idx, f in enumerate(self.fracture_configs):
+            color_hex = "#{:02x}{:02x}{:02x}".format(
+                int(f.color[0]*255), int(f.color[1]*255), int(f.color[2]*255))
+            k_str = f"{f.permeability:.4g}"
+            text = f"[{idx+1}] {f.name}  |  长={f.length:.1f}m  |  宽={f.width_cells}cell  |  K={k_str}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, idx)
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(QColor(color_hex))
+            item.setIcon(QIcon(pixmap))
+            self.fracture_list.addItem(item)
+        self.fracture_info.setText(f"{len(self.fracture_configs)} 个裂隙")
+
+    def add_fracture(self):
+        dialog = FractureEditDialog(parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.fracture_configs.append(dialog.get_config())
+            self.refresh_fracture_list()
+
+    def edit_selected_fracture(self):
+        row = self.fracture_list.currentRow()
+        if row < 0 or row >= len(self.fracture_configs):
+            return
+        dialog = FractureEditDialog(self.fracture_configs[row], parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.fracture_configs[row] = dialog.get_config()
+            self.refresh_fracture_list()
+
+    def delete_selected_fracture(self):
+        row = self.fracture_list.currentRow()
+        if row < 0 or row >= len(self.fracture_configs):
+            return
+        reply = QMessageBox.question(self, "确认删除",
+                                     f"删除裂隙 '{self.fracture_configs[row].name}'？",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.fracture_configs.pop(row)
+            self.refresh_fracture_list()
+
+    # ---- Lens CRUD ----
+
+    def refresh_lens_list(self):
+        self.lens_list.clear()
+        for idx, l in enumerate(self.lens_configs):
+            color_hex = "#{:02x}{:02x}{:02x}".format(
+                int(l.color[0]*255), int(l.color[1]*255), int(l.color[2]*255))
+            k_str = f"{l.permeability:.4g}"
+            text = f"[{idx+1}] {l.name}  |  r={l.radius:.1f}m  |  K={k_str}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, idx)
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(QColor(color_hex))
+            item.setIcon(QIcon(pixmap))
+            self.lens_list.addItem(item)
+        self.lens_info.setText(f"{len(self.lens_configs)} 个透镜体")
+
+    def add_lens(self):
+        dialog = LensEditDialog(parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.lens_configs.append(dialog.get_config())
+            self.refresh_lens_list()
+
+    def edit_selected_lens(self):
+        row = self.lens_list.currentRow()
+        if row < 0 or row >= len(self.lens_configs):
+            return
+        dialog = LensEditDialog(self.lens_configs[row], parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.lens_configs[row] = dialog.get_config()
+            self.refresh_lens_list()
+
+    def delete_selected_lens(self):
+        row = self.lens_list.currentRow()
+        if row < 0 or row >= len(self.lens_configs):
+            return
+        reply = QMessageBox.question(self, "确认删除",
+                                     f"删除透镜体 '{self.lens_configs[row].name}'？",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.lens_configs.pop(row)
+            self.refresh_lens_list()
+
     # ---- Button State ----
 
     def set_button_busy(self):
@@ -927,6 +1476,24 @@ class MainWindow(QMainWindow):
             self.last_terrain_surface = terrain_surface
             self.last_inside_mask = inside_mask
 
+            # ---- Post-processing: Fractures (config-list driven) ----
+            frac_gen = FractureGenerator(
+                configs=self.fracture_configs,
+                seed=generator.seed + 1000,
+            )
+            fracture_ids = frac_gen.generate(
+                solid, x, y, z, stratum_tops, terrain_surface, inside_mask)
+            self.last_fracture_ids = fracture_ids
+
+            # ---- Post-processing: Lenses (config-list driven) ----
+            lens_gen = LensGenerator(
+                configs=self.lens_configs,
+                seed=generator.seed + 2000,
+            )
+            lens_ids = lens_gen.generate(
+                solid, x, y, z, stratum_tops, terrain_surface, inside_mask)
+            self.last_lens_ids = lens_ids
+
             grid = pv.ImageData()
             grid.dimensions = np.array(solid.shape) + 1
             grid.origin = (float(x.min()), float(y.min()), float(z.min()))
@@ -936,6 +1503,8 @@ class MainWindow(QMainWindow):
                 float(z[1] - z[0]) if len(z) > 1 else 1.0,
             )
             grid.cell_data["stratum_id"] = solid.flatten(order="F")
+            grid.cell_data["fracture_id"] = fracture_ids.flatten(order="F")
+            grid.cell_data["lens_id"] = lens_ids.flatten(order="F")
             self.last_grid = grid
 
             # Layered rendering: bottom stratum → ... → top stratum → soil cap
@@ -966,6 +1535,36 @@ class MainWindow(QMainWindow):
                     smooth_shading=True, show_edges=False, lighting=True,
                     specular=0.3, specular_power=20)
                 self._tracked_actors.append(actor)
+
+            # ---- Render fractures (per-config color) ----
+            for fid, fcfg in enumerate(self.fracture_configs, 1):
+                mask = (fracture_ids == fid)
+                if not np.any(mask):
+                    continue
+                frac_grid = grid.threshold([fid - 0.5, fid + 0.5], scalars="fracture_id")
+                if frac_grid.n_cells > 0:
+                    frac_surf = frac_grid.extract_surface(algorithm='dataset_surface')
+                    if frac_surf.n_points > 0:
+                        frac_actor = self.plotter.add_mesh(
+                            frac_surf, color=fcfg.color, opacity=0.95,
+                            smooth_shading=True, show_edges=False, lighting=True,
+                            specular=0.5, specular_power=30)
+                        self._tracked_actors.append(frac_actor)
+
+            # ---- Render lenses (per-config color) ----
+            for lid, lcfg in enumerate(self.lens_configs, 1):
+                mask = (lens_ids == lid)
+                if not np.any(mask):
+                    continue
+                lens_grid = grid.threshold([lid - 0.5, lid + 0.5], scalars="lens_id")
+                if lens_grid.n_cells > 0:
+                    lens_surf = lens_grid.extract_surface(algorithm='dataset_surface')
+                    if lens_surf.n_points > 0:
+                        lens_actor = self.plotter.add_mesh(
+                            lens_surf, color=lcfg.color, opacity=0.85,
+                            smooth_shading=True, show_edges=False, lighting=True,
+                            specular=0.4, specular_power=25)
+                        self._tracked_actors.append(lens_actor)
 
             axes_actor = self.plotter.add_axes()
             self._tracked_actors.append(axes_actor)
@@ -1026,12 +1625,12 @@ class MainWindow(QMainWindow):
         z_max_ext = ((max_height // z_step) + 1) * z_step
         z_min, z_max = -z_min_ext, z_max_ext
         bounds = [float(x_min), float(x_max), float(y_min), float(y_max), float(z_min), float(z_max)]
-        n_x = min(int((x_max - x_min) / xy_step) + 1, 15)
-        n_y = min(int((y_max - y_min) / xy_step) + 1, 15)
-        n_z = min(int((z_max - z_min) / z_step) + 1, 15)
+        n_x = int((x_max - x_min) / xy_step) + 1
+        n_y = int((y_max - y_min) / xy_step) + 1
+        n_z = int((z_max - z_min) / z_step) + 1
         bounds_actor = self.plotter.show_bounds(
             bounds=bounds, grid='front', location='outer', ticks='outside',
-            all_edges=True, xtitle='X (m)', ytitle='Y (m)', ztitle='高程 (m)',
+            all_edges=True, xtitle='X (m)', ytitle='Y (m)', ztitle='Z (m)',
             fmt='%.0f', n_xlabels=n_x, n_ylabels=n_y, n_zlabels=n_z)
         try:
             bounds_actor.SetXAxisRange(x_min, x_max)
@@ -1043,21 +1642,85 @@ class MainWindow(QMainWindow):
 
     # ---- Export ----
 
-    def export_mesh_stl(self):
-        if not self.current_meshes:
+    def export_mesh_data(self):
+        """Export MODFLOW-friendly .npz with structured grid data."""
+        if not hasattr(self, 'last_solid') or self.last_solid is None:
             QMessageBox.warning(self, "导出失败", "请先生成模型")
             return
         filename, _ = QFileDialog.getSaveFileName(
-            self, "保存 STL", "geology_model.stl", "STL Files (*.stl)")
+            self, "保存网格数据", "geology_data.npz", "NumPy Files (*.npz)")
         if not filename:
             return
         try:
-            merged = pv.MultiBlock(list(self.current_meshes.values()))
-            combined = merged.combine()
-            combined.save(filename)
-            QMessageBox.information(self, "导出成功", f"已保存:\n{filename}")
+            solid = self.last_solid
+            x, y, z = self.last_x, self.last_y, self.last_z
+            stratum_tops = self.last_stratum_tops
+            soil_bottom = self.last_soil_bottom
+            terrain_surface = self.last_terrain_surface
+            inside_mask = self.last_inside_mask
+            n_strata = len(self.strata)
+
+            # ---- Build permeability array (K per cell) ----
+            # Priority: lens > fracture > stratum/soil
+            K = np.zeros_like(solid, dtype=np.float64)
+            for s_idx, s in enumerate(self.strata):
+                K[solid == (s_idx + 1)] = s.permeability
+            if self.soil_config.thickness > 0:
+                K[solid == (n_strata + 1)] = self.soil_config.permeability
+
+            # Override with per-fracture K (each config has its own permeability)
+            fracture_ids = getattr(self, 'last_fracture_ids', np.zeros_like(solid))
+            for fid, fcfg in enumerate(self.fracture_configs, 1):
+                K[fracture_ids == fid] = fcfg.permeability
+
+            # Override with per-lens K (each config has its own permeability)
+            lens_ids = getattr(self, 'last_lens_ids', np.zeros_like(solid))
+            for lid, lcfg in enumerate(self.lens_configs, 1):
+                K[lens_ids == lid] = lcfg.permeability
+
+            # ---- Build IDOMAIN-like active mask ----
+            idomain = (solid > 0).astype(np.int32)
+
+            # ---- Grid spacings ----
+            dx = float(x[1] - x[0]) if len(x) > 1 else 1.0
+            dy = float(y[1] - y[0]) if len(y) > 1 else 1.0
+            dz = float(z[1] - z[0]) if len(z) > 1 else 1.0
+
+            # ---- Save ----
+            np.savez(
+                filename,
+                # Core voxel data
+                stratum_id=solid,              # (nx, ny, nz) int — stratum markers
+                permeability=K,                # (nx, ny, nz) float — K per cell
+                idomain=idomain,               # (nx, ny, nz) int — 1=active, 0=inactive
+                fracture_id=fracture_ids,      # (nx, ny, nz) int — 0=none, 1..M=fracture
+                lens_id=lens_ids,              # (nx, ny, nz) int — 0=none, 1..P=lens
+                # Geometry
+                x=x, y=y, z=z,                 # 1D coordinate axes
+                dx=dx, dy=dy, dz=dz,           # grid spacings
+                # Surfaces
+                top_elevation=terrain_surface, # (nx, ny) — ground surface
+                soil_bottom=soil_bottom,       # (nx, ny) — soil cap bottom (non-uniform)
+                inside_mask=inside_mask,       # (nx, ny) bool — parcel boundary
+                # Metadata
+                n_strata=n_strata,
+                soil_thickness_avg=self.soil_config.thickness,
+            )
+
+            QMessageBox.information(
+                self, "导出成功",
+                f"已保存: {filename}\n\n"
+                f"包含数组:\n"
+                f"  stratum_id    {solid.shape}   int32   地层标记\n"
+                f"  permeability  {K.shape}   float64 渗透系数(裂隙/透镜体已覆盖)\n"
+                f"  idomain       {idomain.shape}   int32   1=活跃 0=空白\n"
+                f"  fracture_id   {fracture_ids.shape}   int32   裂隙标记\n"
+                f"  lens_id       {lens_ids.shape}   int32   透镜体标记\n"
+                f"  top_elevation {terrain_surface.shape}   float64 地表高程\n"
+                f"  soil_bottom   {soil_bottom.shape}   float64 覆土底面\n"
+                f"  x, y, z       坐标轴 + 网格间距 dx, dy, dz")
         except Exception as e:
-            QMessageBox.critical(self, "导出失败", str(e))
+            QMessageBox.critical(self, "导出失败", f"{str(e)}\n\n{traceback.format_exc()}")
 
     def export_mesh_vtk(self):
         if not hasattr(self, 'last_grid') or self.last_grid is None:
