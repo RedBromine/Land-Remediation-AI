@@ -39,6 +39,9 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QIcon, QPixmap, QFont
 
+# Post-processing window
+from postprocess_window import PostProcessWindow
+
 
 # =========================================================
 # Pure NumPy Perlin Noise
@@ -195,6 +198,8 @@ class GeologyGenerator:
         complexity=0.0,
         strata=None,
         seed=None,
+        soil_threshold_min=0.15,
+        soil_threshold_max=0.35,
     ):
         self.radius = radius
         self.irregularity = irregularity
@@ -208,6 +213,8 @@ class GeologyGenerator:
         self.lacunarity = lacunarity
         self.soil_thickness = max(0.0, soil_thickness)
         self.complexity = max(0.0, min(1.0, complexity))
+        self.soil_threshold_min = max(0.0, min(1.0, soil_threshold_min))
+        self.soil_threshold_max = max(self.soil_threshold_min, min(1.0, soil_threshold_max))
         self.strata = []
         if strata:
             for s in strata:
@@ -320,8 +327,10 @@ class GeologyGenerator:
         soil_noise = soil_noise - soil_noise.min()
         soil_noise = soil_noise / soil_noise.max()
 
-        # Random threshold: ~15-35% of area becomes bare rock
-        threshold = self.rng.uniform(0.15, 0.35)
+        # Random threshold within user-defined range
+        t_min = self.soil_threshold_min
+        t_max = self.soil_threshold_max
+        threshold = self.rng.uniform(t_min, t_max)
         soil_thickness_field = np.where(
             soil_noise > threshold,
             (soil_noise - threshold) / (1.0 - threshold) * self.soil_thickness,
@@ -639,9 +648,9 @@ class StratumEditDialog(QDialog):
         # Permeability
         self.perm_spin = QDoubleSpinBox()
         self.perm_spin.setRange(0.0, 10000.0)
-        self.perm_spin.setDecimals(6)
+        self.perm_spin.setDecimals(8)
         self.perm_spin.setSingleStep(0.0001)
-        self.perm_spin.setValue(round(self.config.permeability, 6))
+        self.perm_spin.setValue(round(self.config.permeability, 8))
         form.addRow("渗透系数 K:", self.perm_spin)
 
         # Color
@@ -675,7 +684,7 @@ class StratumEditDialog(QDialog):
             c = preset["color"]
             self.current_color = QColor(int(c[0]*255), int(c[1]*255), int(c[2]*255))
             self._update_color_preview()
-            self.perm_spin.setValue(preset.get("permeability", 1.0))
+            self.perm_spin.setValue(round(preset.get("permeability", 1.0), 8))
 
     def choose_color(self):
         color = QColorDialog.getColor(self.current_color, self, "选择地层颜色")
@@ -692,7 +701,7 @@ class StratumEditDialog(QDialog):
             name=self.name_edit.text().strip() or "地层",
             thickness=self.thickness_spin.value(),
             color=[self.current_color.redF(), self.current_color.greenF(), self.current_color.blueF()],
-            permeability=round(self.perm_spin.value(), 6),
+            permeability=round(self.perm_spin.value(), 8),
             preset_name=self.preset_combo.currentText(),
         )
 
@@ -731,9 +740,9 @@ class FractureEditDialog(QDialog):
 
         self.perm_spin = QDoubleSpinBox()
         self.perm_spin.setRange(0.0, 100000.0)
-        self.perm_spin.setDecimals(4)
+        self.perm_spin.setDecimals(8)
         self.perm_spin.setSingleStep(1.0)
-        self.perm_spin.setValue(round(self.config.permeability, 4))
+        self.perm_spin.setValue(round(self.config.permeability, 8))
         form.addRow("渗透系数 K:", self.perm_spin)
 
         color_layout = QHBoxLayout()
@@ -775,7 +784,7 @@ class FractureEditDialog(QDialog):
             name=self.name_edit.text().strip() or "裂隙",
             length=self.length_spin.value(),
             width_cells=self.width_spin.value(),
-            permeability=round(self.perm_spin.value(), 4),
+            permeability=round(self.perm_spin.value(), 8),
             color=[self.current_color.redF(), self.current_color.greenF(), self.current_color.blueF()],
         )
 
@@ -809,9 +818,9 @@ class LensEditDialog(QDialog):
 
         self.perm_spin = QDoubleSpinBox()
         self.perm_spin.setRange(0.0, 100000.0)
-        self.perm_spin.setDecimals(4)
+        self.perm_spin.setDecimals(8)
         self.perm_spin.setSingleStep(0.1)
-        self.perm_spin.setValue(round(self.config.permeability, 4))
+        self.perm_spin.setValue(round(self.config.permeability, 8))
         form.addRow("渗透系数 K:", self.perm_spin)
 
         color_layout = QHBoxLayout()
@@ -852,7 +861,7 @@ class LensEditDialog(QDialog):
         return LensConfig(
             name=self.name_edit.text().strip() or "透镜体",
             radius=self.radius_spin.value(),
-            permeability=round(self.perm_spin.value(), 4),
+            permeability=round(self.perm_spin.value(), 8),
             color=[self.current_color.redF(), self.current_color.greenF(), self.current_color.blueF()],
         )
 
@@ -957,6 +966,18 @@ class MainWindow(QMainWindow):
         export_layout.addWidget(self.export_data_btn)
         export_layout.addWidget(self.export_vtk_btn)
         control_layout.addLayout(export_layout)
+
+        # Post-processing button
+        self.postprocess_btn = QPushButton("网格参数调整")
+        self.postprocess_btn.setMinimumHeight(36)
+        self.postprocess_btn.setStyleSheet(
+            "QPushButton { background-color: #2980b9; color: white; font-weight: bold;"
+            "  border: none; padding: 8px; border-radius: 6px; font-size: 13px; }"
+            "QPushButton:hover { background-color: #3498db; }")
+        self.postprocess_btn.clicked.connect(self.open_postprocess_window)
+        self.postprocess_btn.setToolTip("K随机化 / 水头模拟 / 污染物输运")
+        control_layout.addWidget(self.postprocess_btn)
+
         control_layout.addStretch()
         self.set_button_ready()
 
@@ -980,9 +1001,11 @@ class MainWindow(QMainWindow):
         self.height_spin = self._add_spin(layout, "最大地表高度 (m)", 1, 500, 15)
         self.grid_spin = self._add_spin(layout, "XY 网格分辨率", 20, 300, 80)
         self.soil_spin = self._add_double(layout, "覆土厚度 (m)", 0.0, 50.0, 5.0, 0.5)
+        self.soil_th_min_spin = self._add_double(layout, "覆土阈值下限", 0.0, 1.0, 0.15, 0.05)
+        self.soil_th_max_spin = self._add_double(layout, "覆土阈值上限", 0.0, 1.0, 0.35, 0.05)
         self.complexity_spin = self._add_double(layout, "地层复杂度", 0.0, 1.0, 0.3, 0.05)
 
-        info = QLabel("复杂度参考:\n  0.0=完全水平  0.4=倾斜+褶皱  0.8=强变形+断层")
+        info = QLabel("复杂度参考:\n  0.0=完全水平  0.4=倾斜+褶皱  0.8=强变形+断层\n覆土阈值: 下限越低裸露越少，上限越高裸露越多")
         info.setStyleSheet("color: #555; font-size: 11px; padding: 6px; background: #f5f5f5; border-radius: 4px;")
         layout.addWidget(info)
         layout.addStretch()
@@ -1464,6 +1487,8 @@ class MainWindow(QMainWindow):
                 soil_thickness=soil_thickness,
                 complexity=complexity,
                 strata=[s.to_dict() for s in self.strata],
+                soil_threshold_min=self.soil_th_min_spin.value(),
+                soil_threshold_max=self.soil_th_max_spin.value(),
             )
 
             solid, x, y, z, stratum_tops, soil_bottom, terrain_surface, inside_mask = \
@@ -1505,6 +1530,18 @@ class MainWindow(QMainWindow):
             grid.cell_data["stratum_id"] = solid.flatten(order="F")
             grid.cell_data["fracture_id"] = fracture_ids.flatten(order="F")
             grid.cell_data["lens_id"] = lens_ids.flatten(order="F")
+            # Build and save permeability array
+            n_strata = len(self.strata)
+            K_arr = np.zeros_like(solid, dtype=np.float64)
+            for s_idx, s in enumerate(self.strata):
+                K_arr[solid == (s_idx + 1)] = s.permeability
+            if self.soil_config.thickness > 0:
+                K_arr[solid == (n_strata + 1)] = self.soil_config.permeability
+            for fid, fcfg in enumerate(self.fracture_configs, 1):
+                K_arr[fracture_ids == fid] = fcfg.permeability
+            for lid, lcfg in enumerate(self.lens_configs, 1):
+                K_arr[lens_ids == lid] = lcfg.permeability
+            grid.cell_data["permeability"] = K_arr.flatten(order="F")
             self.last_grid = grid
 
             # Layered rendering: bottom stratum → ... → top stratum → soil cap
@@ -1641,6 +1678,31 @@ class MainWindow(QMainWindow):
         self._tracked_actors.append(bounds_actor)
 
     # ---- Export ----
+
+    def open_postprocess_window(self):
+        """Open post-processing window with current model data."""
+        if not hasattr(self, 'last_solid') or self.last_solid is None:
+            QMessageBox.information(self, "提示", "请先生成地质模型")
+            return
+        try:
+            grid_data = {
+                'stratum_id': self.last_solid,
+                'permeability': self.last_grid.cell_data.get("permeability", np.zeros_like(self.last_solid, dtype=np.float64)),
+                'idomain': (self.last_solid > 0).astype(np.int32),
+                'fracture_id': getattr(self, 'last_fracture_ids', np.zeros_like(self.last_solid)),
+                'lens_id': getattr(self, 'last_lens_ids', np.zeros_like(self.last_solid)),
+                'terrain_surface': getattr(self, 'last_terrain_surface', None),
+                'soil_bottom': getattr(self, 'last_soil_bottom', None),
+                'inside_mask': getattr(self, 'last_inside_mask', None),
+            }
+            self.pp_window = PostProcessWindow(
+                parent=self,
+                grid_data=grid_data,
+                x=self.last_x, y=self.last_y, z=self.last_z
+            )
+            self.pp_window.show()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开后处理窗口失败:\n{str(e)}\n\n{traceback.format_exc()}")
 
     def export_mesh_data(self):
         """Export MODFLOW-friendly .npz with structured grid data."""
